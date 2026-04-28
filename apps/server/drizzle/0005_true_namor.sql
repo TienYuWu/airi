@@ -20,7 +20,7 @@ CREATE TABLE "system_provider_configs" (
 	"deleted_at" timestamp
 );
 --> statement-breakpoint
-ALTER TABLE "user_settings_provider_configs" RENAME TO "user_provider_configs";--> statement-breakpoint
+ALTER TABLE "provider_configs" RENAME TO "user_provider_configs";--> statement-breakpoint
 ALTER TABLE "character_bookmarks" RENAME TO "user_character_bookmarks";--> statement-breakpoint
 ALTER TABLE "character_likes" RENAME TO "user_character_likes";--> statement-breakpoint
 ALTER TABLE "user_character_bookmarks" DROP CONSTRAINT "character_bookmarks_user_id_user_id_fk";
@@ -31,7 +31,7 @@ ALTER TABLE "user_character_likes" DROP CONSTRAINT "character_likes_user_id_user
 --> statement-breakpoint
 ALTER TABLE "user_character_likes" DROP CONSTRAINT "character_likes_character_id_characters_id_fk";
 --> statement-breakpoint
-ALTER TABLE "user_provider_configs" DROP CONSTRAINT "user_settings_provider_configs_owner_id_user_id_fk";
+ALTER TABLE "user_provider_configs" DROP CONSTRAINT "provider_configs_owner_id_user_id_fk";
 --> statement-breakpoint
 ALTER TABLE "user_character_bookmarks" DROP CONSTRAINT "character_bookmarks_user_id_character_id_pk";--> statement-breakpoint
 ALTER TABLE "user_character_likes" DROP CONSTRAINT "character_likes_user_id_character_id_pk";--> statement-breakpoint
