@@ -3,7 +3,7 @@ import type { ChatProvider } from '@xsai-ext/providers/utils'
 
 import { isStageTamagotchi } from '@proj-airi/stage-shared'
 import { useAudioAnalyzer } from '@proj-airi/stage-ui/composables'
-import { useAudioContext } from '@proj-airi/stage-ui/stores/audio'
+import { useAudioContext, useSpeakingStore } from '@proj-airi/stage-ui/stores/audio'
 import { useChatOrchestratorStore } from '@proj-airi/stage-ui/stores/chat'
 import { useChatSessionStore } from '@proj-airi/stage-ui/stores/chat/session-store'
 import { useConsciousnessStore } from '@proj-airi/stage-ui/stores/modules/consciousness'
@@ -35,6 +35,7 @@ const chatSession = useChatSessionStore()
 const { ingest, onAfterMessageComposed, discoverToolsCompatibility } = chatOrchestrator
 const { messages } = storeToRefs(chatSession)
 const { audioContext } = useAudioContext()
+const { nowSpeaking } = storeToRefs(useSpeakingStore())
 const { t } = useI18n()
 
 // Transcription pipeline
@@ -288,6 +289,7 @@ async function startListening() {
     try {
       await transcribeForMediaStream(stream.value, {
         onSentenceEnd: (delta) => {
+          if (nowSpeaking.value) return
           if (delta && delta.trim()) {
             // Append transcribed text to message input
             const currentText = messageInput.value.trim()
@@ -393,6 +395,26 @@ watch(autoSendEnabled, (enabled) => {
     // Auto-send was disabled - clear any pending auto-send
     clearPendingAutoSend()
     console.info('[ChatArea] Auto-send disabled, cleared pending text')
+  }
+})
+
+// Half-duplex: stop recognition while character is speaking, restart after a cooldown.
+// Chrome's Web Speech API captures audio independently of the MediaStream so
+// echoCancellation alone is not reliable — we must pause the recogniser entirely.
+watch(nowSpeaking, async (speaking) => {
+  if (speaking) {
+    clearPendingAutoSend()
+    if (isListening.value) {
+      await stopStreamingTranscription(true)
+      isListening.value = false
+    }
+  }
+  else {
+    setTimeout(async () => {
+      if (!nowSpeaking.value && enabled.value && stream.value && !isListening.value) {
+        await startListening()
+      }
+    }, 500)
   }
 })
 </script>

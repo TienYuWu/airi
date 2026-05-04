@@ -66,7 +66,7 @@ const {
   live2dShadowEnabled,
   live2dMaxFps,
 } = storeToRefs(settingsStore)
-const { mouthOpenSize } = storeToRefs(useSpeakingStore())
+const { mouthOpenSize, nowSpeaking } = storeToRefs(useSpeakingStore())
 const { audioContext } = useAudioContext()
 const currentAudioSource = ref<AudioBufferSourceNode>()
 
@@ -112,7 +112,6 @@ viewUpdateCleanups.push(vrmStore.onShouldUpdateView(async () => {
 }))
 
 const audioAnalyser = ref<AnalyserNode>()
-const nowSpeaking = ref(false)
 const lipSyncStarted = ref(false)
 const lipSyncLoopId = ref<number>()
 const live2dLipSync = ref<Live2DLipSync>()

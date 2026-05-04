@@ -19,6 +19,7 @@ import { useConsciousnessStore } from '@proj-airi/stage-ui/stores/modules/consci
 import { useHearingSpeechInputPipeline } from '@proj-airi/stage-ui/stores/modules/hearing'
 import { useProvidersStore } from '@proj-airi/stage-ui/stores/providers'
 import { useSettingsAudioDevice } from '@proj-airi/stage-ui/stores/settings'
+import { useSpeakingStore } from '@proj-airi/stage-ui/stores/audio'
 import { breakpointsTailwind, useBreakpoints, useMouse } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
 import { computed, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue'
@@ -52,6 +53,7 @@ const providersStore = useProvidersStore()
 const consciousnessStore = useConsciousnessStore()
 const { activeProvider: activeChatProvider, activeModel: activeChatModel } = storeToRefs(consciousnessStore)
 const chatStore = useChatOrchestratorStore()
+const { nowSpeaking } = storeToRefs(useSpeakingStore())
 
 const shouldUseStreamInput = computed(() => supportsStreamInput.value && !!stream.value)
 
@@ -98,6 +100,7 @@ async function startAudioInteraction() {
 }
 
 async function handleSpeechStart() {
+  if (nowSpeaking.value) return
   // For streaming providers, ChatArea component handles transcription manually
   // The main page should not start automatic transcription to avoid duplicate sessions
   if (shouldUseStreamInput.value) {
