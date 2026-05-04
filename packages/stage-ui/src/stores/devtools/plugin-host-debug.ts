@@ -6,6 +6,7 @@ export interface PluginManifestSummary {
   entrypoints: Record<string, string | undefined>
   path: string
   enabled: boolean
+  autoReload: boolean
   loaded: boolean
   isNew: boolean
 }
@@ -15,9 +16,11 @@ export interface PluginRegistrySnapshot {
   plugins: PluginManifestSummary[]
 }
 
+// TODO: Replace with re-export of CapabilityDescriptor from
+// @proj-airi/plugin-sdk once stage-ui can depend on the SDK.
 export interface PluginCapabilityState {
   key: string
-  state: 'announced' | 'ready'
+  state: 'announced' | 'ready' | 'degraded' | 'withdrawn'
   metadata?: Record<string, unknown>
   updatedAt: number
 }
@@ -30,9 +33,36 @@ export interface PluginHostSessionSummary {
   moduleId: string
 }
 
+export interface PluginHostKitCapabilitySummary {
+  key: string
+  actions: string[]
+}
+
+export interface PluginHostKitSummary {
+  kitId: string
+  version: string
+  capabilities: PluginHostKitCapabilitySummary[]
+  runtimes: Array<'electron' | 'node' | 'web'>
+}
+
+export interface PluginHostModuleSummary {
+  moduleId: string
+  ownerSessionId: string
+  ownerPluginId: string
+  kitId: string
+  kitModuleType: string
+  state: 'announced' | 'active' | 'degraded' | 'withdrawn'
+  runtime: 'electron' | 'node' | 'web'
+  revision: number
+  updatedAt: number
+  config: Record<string, unknown>
+}
+
 export interface PluginHostDebugSnapshot {
   registry: PluginRegistrySnapshot
   sessions: PluginHostSessionSummary[]
+  kits: PluginHostKitSummary[]
+  modules: PluginHostModuleSummary[]
   capabilities: PluginCapabilityState[]
   refreshedAt: number
 }
@@ -40,6 +70,7 @@ export interface PluginHostDebugSnapshot {
 interface PluginHostDebugBridge {
   list: () => Promise<PluginRegistrySnapshot>
   setEnabled: (payload: { name: string, enabled: boolean, path?: string }) => Promise<PluginRegistrySnapshot>
+  setAutoReload: (payload: { name: string, enabled: boolean }) => Promise<PluginRegistrySnapshot>
   loadEnabled: () => Promise<PluginRegistrySnapshot>
   load: (payload: { name: string }) => Promise<PluginRegistrySnapshot>
   unload: (payload: { name: string }) => Promise<PluginRegistrySnapshot>
@@ -58,6 +89,7 @@ export const usePluginHostInspectorStore = defineStore('devtools:plugin-host-deb
   const bridge = ref<PluginHostDebugBridge>()
   const registry = ref<PluginRegistrySnapshot>()
   const sessions = ref<PluginHostSessionSummary[]>([])
+  const kits = ref<PluginHostKitSummary[]>([])
   const capabilities = ref<PluginCapabilityState[]>([])
   const refreshedAt = ref<number>()
   const error = ref<string>()
@@ -85,6 +117,7 @@ export const usePluginHostInspectorStore = defineStore('devtools:plugin-host-deb
   function assignInspection(snapshot: PluginHostDebugSnapshot) {
     assignRegistry(snapshot.registry)
     sessions.value = snapshot.sessions
+    kits.value = snapshot.kits
     capabilities.value = snapshot.capabilities
     refreshedAt.value = snapshot.refreshedAt
   }
@@ -144,6 +177,13 @@ export const usePluginHostInspectorStore = defineStore('devtools:plugin-host-deb
     return nextRegistry
   }
 
+  async function setAutoReload(payload: { name: string, enabled: boolean }) {
+    const nextRegistry = await withBridge(activeBridge => activeBridge.setAutoReload(payload))
+    assignRegistry(nextRegistry)
+    await refreshInspection()
+    return nextRegistry
+  }
+
   async function loadEnabled() {
     const nextRegistry = await withBridge(activeBridge => activeBridge.loadEnabled())
     assignRegistry(nextRegistry)
@@ -168,6 +208,7 @@ export const usePluginHostInspectorStore = defineStore('devtools:plugin-host-deb
   return {
     registry,
     sessions,
+    kits,
     capabilities,
     refreshedAt,
     loading,
@@ -183,6 +224,7 @@ export const usePluginHostInspectorStore = defineStore('devtools:plugin-host-deb
     refreshInspection,
     refreshAll,
     setEnabled,
+    setAutoReload,
     loadEnabled,
     load,
     unload,

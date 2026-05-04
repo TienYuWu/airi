@@ -6,6 +6,8 @@ export type PerceptionSignalType
     | 'social_gesture' // e.g. waving
     | 'social_presence'
     | 'system_message' // e.g. death messages, join/leave
+    | 'airi_command' // instruction from AIRI via spark:command
+    | 'airi_context' // context update from AIRI via context:update
 
 export interface PerceptionSignal {
   type: PerceptionSignalType
@@ -17,5 +19,6 @@ export interface PerceptionSignal {
   timestamp: number
 
   // Structured Data (for logic)
+  // FIXME unsafe type
   metadata: Record<string, any>
 }

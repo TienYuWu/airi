@@ -182,7 +182,7 @@ class DebugClient {
 
   scheduleReconnect() {
     if (this.reconnectAttempts >= CONFIG.RECONNECT_MAX_ATTEMPTS) {
-      console.log('Max reconnect attempts reached')
+      console.warn('Max reconnect attempts reached')
       return
     }
 
@@ -594,7 +594,7 @@ function parseUserMessage(content) {
 class ConversationPanel {
   constructor(client) {
     this.client = client
-    this._mkSession = () => ({ messages: [], greyed: false, activeContext: null, archivedContexts: [], activeContextStartIndex: 0, contextHistoryMessage: null })
+    this._mkSession = () => ({ messages: [], greyed: false })
     this.sessions = [this._mkSession()]
     this.isProcessing = false
     this.autoScroll = true
@@ -637,19 +637,15 @@ class ConversationPanel {
 
   handleUpdate(data) {
     if (data.sessionBoundary) {
-      const cur = this.sessions[this.sessions.length - 1]
+      const cur = this.sessions.at(-1)
       if (cur)
         cur.greyed = true
       this.sessions.push(this._mkSession())
     }
     else {
-      const cur = this.sessions[this.sessions.length - 1]
+      const cur = this.sessions.at(-1)
       if (cur) {
         cur.messages = data.messages || []
-        cur.activeContext = data.activeContext || null
-        cur.archivedContexts = data.archivedContexts || []
-        cur.activeContextStartIndex = data.activeContextStartIndex ?? 0
-        cur.contextHistoryMessage = data.contextHistoryMessage || null
       }
     }
     this.isProcessing = !!data.isProcessing
@@ -703,16 +699,11 @@ class ConversationPanel {
   // --- Session rendering ---
 
   renderSession(session) {
-    const { messages, activeContext, archivedContexts, contextHistoryMessage } = session
+    const { messages } = session
     if (!messages || messages.length === 0)
       return '<div class="empty-state">No messages yet</div>'
 
     const parts = []
-
-    // Context status bar
-    if (archivedContexts?.length > 0 || activeContext) {
-      parts.push(this.renderContextStatusBar(activeContext, archivedContexts, contextHistoryMessage))
-    }
 
     // Group messages into turns (user+assistant pairs)
     const turns = this.groupIntoTurns(messages)
@@ -753,24 +744,11 @@ class ConversationPanel {
     const n = this.turnCounter
     const userParsed = turn.user ? parseUserMessage(turn.user.content || '') : null
     const eventSection = userParsed?.sections.find(s => s.tag === 'EVENT' || s.tag === 'FEEDBACK')
-    const contextSection = userParsed?.sections.find(s => s.tag === 'CONTEXT')
 
     // Build a short summary for the turn header
     let summary = `Turn ${n}`
     if (eventSection) {
       summary = this.summarizeEvent(eventSection)
-    }
-
-    // Detect context label from the [CONTEXT] section
-    let ctxBadge = ''
-    if (contextSection) {
-      const ctxMatch = contextSection.text.match(/active="([^"]+)"/)
-      if (ctxMatch) {
-        ctxBadge = `<span class="cv-ctx-badge cv-ctx-active">${escapeHtml(ctxMatch[1])}</span>`
-      }
-      else if (contextSection.text.includes('no active context')) {
-        ctxBadge = '<span class="cv-ctx-badge cv-ctx-none">no ctx</span>'
-      }
     }
 
     const turnId = `cv-turn-${n}`
@@ -782,7 +760,6 @@ class ConversationPanel {
         <span class="cv-arrow">\u25B6</span>
         <span class="cv-turn-num">#${n}</span>
         <span class="cv-turn-summary">${escapeHtml(summary)}</span>
-        ${ctxBadge}
       </button>
       <div class="cv-turn-body" id="${turnId}">
         ${userHtml}
@@ -818,6 +795,7 @@ class ConversationPanel {
 
     // FEEDBACK: "toolName: Success/Failed. details"
     if (section.tag === 'FEEDBACK') {
+      // eslint-disable-next-line regexp/no-super-linear-backtracking
       const fbMatch = text.match(/^(\w+):\s*(Success|Failed)\.?\s*(.*)$/s)
       if (fbMatch) {
         const detail = fbMatch[3].slice(0, 50)
@@ -922,49 +900,6 @@ class ConversationPanel {
     return `<div class="cv-assistant">${parts.join('')}</div>`
   }
 
-  // --- Context status bar ---
-
-  renderContextStatusBar(activeContext, archivedContexts, contextHistoryMessage) {
-    const parts = []
-    // Active context indicator
-    if (activeContext?.label) {
-      parts.push(`<span class="cv-ctx-status-active"><span class="cv-ctx-dot"></span> ${escapeHtml(activeContext.label)} (${activeContext.messageCount} msgs)</span>`)
-    }
-    else {
-      parts.push('<span class="cv-ctx-status-idle"><span class="cv-ctx-dot cv-ctx-dot-idle"></span> No active context</span>')
-    }
-
-    // Archived count
-    if (archivedContexts?.length > 0) {
-      const archId = `cv-archived-${Math.random().toString(36).slice(2, 6)}`
-      const items = archivedContexts.map((ctx, i) => {
-        const time = new Date(ctx.archivedAt).toLocaleTimeString()
-        return `<div class="cv-arch-item">
-          <span class="cv-arch-idx">#${i + 1}</span>
-          <strong>${escapeHtml(ctx.label || 'unnamed')}</strong>
-          <span class="cv-arch-meta">${ctx.turns}t &middot; ${time}</span>
-          <div class="cv-arch-summary">${escapeHtml(ctx.summary)}</div>
-        </div>`
-      }).join('')
-      parts.push(`<button class="cv-ctx-arch-btn" data-toggle="${archId}">
-        <span class="cv-arrow">\u25B6</span> ${archivedContexts.length} archived
-      </button>`)
-      // Append the collapsible body after the status bar
-      parts.push(`<div class="cv-ctx-arch-body" id="${archId}">${items}</div>`)
-    }
-
-    // Context history prefix
-    if (contextHistoryMessage) {
-      const chId = `cv-ctxhist-${Math.random().toString(36).slice(2, 6)}`
-      parts.push(`<button class="cv-ctx-hist-btn" data-toggle="${chId}">
-        <span class="cv-arrow">\u25B6</span> prefix
-      </button>`)
-      parts.push(`<div class="cv-ctx-hist-body" id="${chId}"><pre class="cv-ctx-hist-content">${escapeHtml(contextHistoryMessage)}</pre></div>`)
-    }
-
-    return `<div class="cv-ctx-bar">${parts.join('')}</div>`
-  }
-
   // --- System message ---
 
   renderSystemMessage(msg) {
@@ -1009,6 +944,7 @@ class ToolsPanel {
   }
 
   requestTools() {
+    // eslint-disable-next-line no-console
     console.log('[ToolsPanel] Requesting tools...')
     // Check if we already have tools to avoid re-rendering on reconnect if not needed
     // But re-requesting ensures we are in sync with server capabilities
@@ -1086,18 +1022,38 @@ class ToolsPanel {
         ${tool.params.map(param => `
           <div class="param-group">
             <label class="param-label">${escapeHtml(param.name)} (${param.type})</label>
-            <input
-              type="${param.type === 'number' ? 'number' : 'text'}"
-              class="param-input"
-              data-param="${param.name}"
-              ${param.min !== undefined ? `min="${param.min}"` : ''}
-              ${param.max !== undefined ? `max="${param.max}"` : ''}
-              ${param.default !== undefined ? `value="${param.default}"` : ''}
-              placeholder="${escapeHtml(param.description || '')}"
-            />
+            ${this.renderParamInput(param)}
           </div>
         `).join('')}
       </div>
+    `
+  }
+
+  renderParamInput(param) {
+    if (param.type === 'boolean') {
+      const defaultValue = param.default === true ? 'true' : 'false'
+      return `
+        <select
+          class="param-input"
+          data-param="${param.name}"
+        >
+          <option value="false" ${defaultValue === 'false' ? 'selected' : ''}>false</option>
+          <option value="true" ${defaultValue === 'true' ? 'selected' : ''}>true</option>
+        </select>
+      `
+    }
+
+    const defaultValue = param.default !== undefined ? `value="${escapeHtml(String(param.default))}"` : ''
+    return `
+      <input
+        type="${param.type === 'number' ? 'number' : 'text'}"
+        class="param-input"
+        data-param="${param.name}"
+        ${param.min !== undefined ? `min="${param.min}"` : ''}
+        ${param.max !== undefined ? `max="${param.max}"` : ''}
+        ${defaultValue}
+        placeholder="${escapeHtml(param.description || '')}"
+      />
     `
   }
 
@@ -1119,19 +1075,34 @@ class ToolsPanel {
       if (paramDef) {
         if (paramDef.type === 'number') {
           if (value === '') {
-            // Handle empty number input if needed?
+            continue
+          }
+
+          value = Number.parseFloat(value)
+          if (Number.isNaN(value)) {
+            this.showResult(tool.name, { error: `Invalid number for ${paramName}` }, true)
+            return
+          }
+        }
+        else if (paramDef.type === 'boolean') {
+          if (value === '') {
+            continue
+          }
+
+          const normalized = value.trim().toLowerCase()
+          if (normalized === 'true') {
+            value = true
+          }
+          else if (normalized === 'false') {
+            value = false
           }
           else {
-            value = Number.parseFloat(value)
-            if (isNaN(value)) {
-              this.showResult(tool.name, { error: `Invalid number for ${paramName}` }, true)
-              return
-            }
+            this.showResult(tool.name, { error: `Invalid boolean for ${paramName}` }, true)
+            return
           }
         }
       }
 
-      // Simple type conversion could be improved but sufficient for now
       params[paramName] = value
     }
 
@@ -1151,7 +1122,7 @@ class ToolsPanel {
   }
 
   handleResult(data) {
-    const { toolName, result, error } = data
+    const { toolName, error } = data
 
     this.executingTools.delete(toolName)
     this.updateCardState(toolName, error ? 'error' : 'success')

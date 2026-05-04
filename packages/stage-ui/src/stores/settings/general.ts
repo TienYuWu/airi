@@ -1,9 +1,11 @@
 import messages from '@proj-airi/i18n/locales'
 
+import { resolveSupportedLocale } from '@proj-airi/i18n'
 import { useLocalStorageManualReset } from '@proj-airi/stage-shared/composables'
 import { defineStore } from 'pinia'
 import { onMounted } from 'vue'
 
+<<<<<<< HEAD
 const languageRemap: Record<string, string> = {
   'zh-CN': 'zh-Hans',
   'zh-TW': 'zh-Hant',
@@ -25,6 +27,8 @@ const languageRemap: Record<string, string> = {
   'ja-JP': 'ja',
 }
 
+=======
+>>>>>>> 589df9aff0e3a771c0354b00e10ce111314e1768
 export const useSettingsGeneral = defineStore('settings-general', () => {
   const language = useLocalStorageManualReset<string>('settings/language', '')
 
@@ -41,6 +45,7 @@ export const useSettingsGeneral = defineStore('settings-general', () => {
       language = navigator.language || 'zh-TW'
     }
 
+<<<<<<< HEAD
     const languages = Object.keys(messages!)
     if (languageRemap[language || 'zh-TW'] != null) {
       language = languageRemap[language || 'zh-TW']
@@ -49,6 +54,9 @@ export const useSettingsGeneral = defineStore('settings-general', () => {
       return language
 
     return 'zh-Hant'
+=======
+    return resolveSupportedLocale(language, Object.keys(messages!))
+>>>>>>> 589df9aff0e3a771c0354b00e10ce111314e1768
   }
 
   function resetState() {

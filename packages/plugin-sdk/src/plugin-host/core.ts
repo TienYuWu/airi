@@ -1,23 +1,39 @@
-import type {
-  ProtocolEvents,
-  ModuleConfigEnvelope as ProtocolModuleConfigEnvelope,
-  ModuleIdentity as ProtocolModuleIdentity,
-  ModulePhase as ProtocolModulePhase,
-  PluginIdentity as ProtocolPluginIdentity,
-} from '@proj-airi/plugin-protocol/types'
 import type { ActorRefFrom } from 'xstate'
 
-import type { definePlugin } from '../plugin'
 import type { createApis } from '../plugin/apis/client'
-import type { CapabilityDescriptor } from '../plugin/apis/protocol'
+import type { AnnounceBindingInput, UpdateBindingInput } from '../plugin/apis/client/bindings'
+import type { RegisterToolInput } from '../plugin/apis/client/tools'
 import type { Plugin } from '../plugin/shared'
+import type { BindingRecord, KitCapabilityDescriptor, KitDescriptor } from './shared'
+import type {
+  HostDataRecord,
+  HostDataValue,
+  ManifestV1,
+  ModuleCompatibilityRequest,
+  ModuleConfigEnvelope,
+  ModuleIdentity,
+  ModulePermissionDeclaration,
+  ModulePermissionGrant,
+  PluginHostContribution,
+  PluginHostInstallContext,
+  PluginHostLifecycleEvent,
+  PluginHostLifecycleHook,
+  PluginHostOptions,
+  PluginHostPermissionRequest,
+  PluginHostSessionContext,
+  PluginLoadOptions,
+  PluginRuntime,
+  PluginSessionApiFactory,
+  PluginSessionPhase,
+  PluginStartOptions,
+} from './shared/types'
 import type { PluginTransport } from './transports'
 
-import { join } from 'node:path'
 import { cwd } from 'node:process'
 
 import { defineInvokeHandler } from '@moeru/eventa'
 import {
+  errorPermission,
   moduleAnnounce,
   moduleAuthenticate,
   moduleAuthenticated,
@@ -25,22 +41,58 @@ import {
   moduleCompatibilityResult,
   moduleConfigurationConfigured,
   moduleConfigurationNeeded,
+  modulePermissionsCurrent,
+  modulePermissionsDeclare,
+  modulePermissionsDenied,
+  modulePermissionsGranted,
+  modulePermissionsRequest,
   modulePrepared,
   moduleStatus,
   registryModulesSync,
 } from '@proj-airi/plugin-protocol/types'
-import {
-  literal,
-  object,
-  optional,
-  string,
-} from 'valibot'
 import { createActor, createMachine } from 'xstate'
 
 import { createApis as createBoundApis } from '../plugin/apis/client'
-import { protocolCapabilitySnapshot, protocolCapabilityWait } from '../plugin/apis/protocol'
-import { protocolListProvidersEventName, protocolProviders } from '../plugin/apis/protocol/resources/providers'
+import {
+  getKitBindingResourceKey,
+  pluginBindingApiActivateEventName,
+  pluginBindingApiAnnounceEventName,
+  pluginBindingApiListEventName,
+  pluginBindingApiUpdateEventName,
+  pluginBindingApiWithdrawEventName,
+  pluginBindingRegistryResourceKey,
+} from '../plugin/apis/client/bindings'
+import {
+  pluginKitApiGetCapabilitiesEventName,
+  pluginKitApiListEventName,
+  pluginKitRegistryResourceKey,
+} from '../plugin/apis/client/kits'
+import {
+  pluginToolApiRegisterEventName,
+  pluginToolRegistryResourceKey,
+
+} from '../plugin/apis/client/tools'
+import {
+  protocolCapabilitySnapshot,
+  protocolCapabilitySnapshotEventName,
+  protocolCapabilityWait,
+  protocolCapabilityWaitEventName,
+} from '../plugin/apis/protocol'
+import {
+  protocolListProvidersEventName,
+  protocolProviders,
+} from '../plugin/apis/protocol/resources/providers'
 import { createPluginContext } from './runtimes/node'
+import { FileSystemLoader } from './runtimes/node/loaders'
+import {
+  BindingsRegistryService,
+  DependencyService,
+  KitRegistryService,
+  PermissionService,
+  PluginSessionService,
+  ResourceService,
+  ToolRegistryService,
+} from './runtimes/shared'
 
 /**
  * Plugin Host lifecycle overview (transport-aware):
@@ -304,81 +356,46 @@ function markFailedTransition(session: PluginHostSession) {
   }
 }
 
-function isPluginDefinition(value: unknown): value is ReturnType<typeof definePlugin> {
-  return typeof value === 'object'
-    && value !== null
-    && 'setup' in value
-    && typeof (value as { setup?: unknown }).setup === 'function'
-}
-
-async function coercePluginFromModule(moduleValue: unknown): Promise<Plugin> {
-  if (isPluginDefinition(moduleValue)) {
-    return await moduleValue.setup()
-  }
-
-  if (typeof moduleValue === 'object' && moduleValue !== null) {
-    if ('default' in moduleValue && isPluginDefinition((moduleValue as { default?: unknown }).default)) {
-      return await (moduleValue as { default: ReturnType<typeof definePlugin> }).default.setup()
-    }
-
-    if ('default' in moduleValue && typeof (moduleValue as { default?: unknown }).default === 'object') {
-      const defaultPlugin = (moduleValue as { default: Plugin }).default
-      if (typeof defaultPlugin.init === 'function' || typeof defaultPlugin.setupModules === 'function') {
-        return defaultPlugin
-      }
-    }
-
-    const plugin = moduleValue as Plugin
-    if (typeof plugin.init === 'function' || typeof plugin.setupModules === 'function') {
-      return plugin
-    }
-  }
-
-  throw new Error('Failed to resolve plugin module. The entrypoint must export either definePlugin(...) or Plugin hooks.')
-}
-
-function createModuleIdentity(name: string, index: number): ModuleIdentity {
-  const sanitizedName = name.trim() || 'plugin'
-
-  return {
-    id: `${sanitizedName}-${index}`,
-    kind: 'plugin',
-    plugin: {
-      id: sanitizedName,
-    },
-  }
-}
-
 // TODO: Maybe support more complex version formats.
+function normalizeVersionList(versions: string[]) {
+  return [...new Set(versions.map(version => version.trim()).filter(Boolean))]
+}
+
 function resolveSupportedVersions(preferredVersion: string, supportedVersions?: string[]) {
-  const list = [preferredVersion, ...(supportedVersions ?? [])]
-  return [...new Set(list)]
+  return normalizeVersionList([preferredVersion, ...(supportedVersions ?? [])])
 }
 
 function resolveNegotiatedVersion(preferredVersion: string, hostSupportedVersions: string[], peerSupportedVersions?: string[]) {
-  if (!peerSupportedVersions?.length) {
-    if (hostSupportedVersions.includes(preferredVersion)) {
+  const normalizedPreferredVersion = preferredVersion.trim()
+  const normalizedHostSupportedVersions = normalizeVersionList(hostSupportedVersions)
+  const normalizedPeerSupportedVersions = peerSupportedVersions && peerSupportedVersions.length > 0
+    ? normalizeVersionList(peerSupportedVersions)
+    : undefined
+
+  if (!normalizedPeerSupportedVersions?.length) {
+    if (normalizedHostSupportedVersions.includes(normalizedPreferredVersion)) {
       return {
-        acceptedVersion: preferredVersion,
+        acceptedVersion: normalizedPreferredVersion,
         exact: true,
       }
     }
 
     return {
       exact: false,
-      reason: `Host does not support preferred version "${preferredVersion}".`,
+      reason: `Host does not support preferred version "${normalizedPreferredVersion}".`,
     }
   }
 
-  if (peerSupportedVersions.includes(preferredVersion) && hostSupportedVersions.includes(preferredVersion)) {
+  if (normalizedPeerSupportedVersions.includes(normalizedPreferredVersion)
+    && normalizedHostSupportedVersions.includes(normalizedPreferredVersion)) {
     return {
-      acceptedVersion: preferredVersion,
+      acceptedVersion: normalizedPreferredVersion,
       exact: true,
     }
   }
 
-  for (const version of hostSupportedVersions) {
-    if (peerSupportedVersions.includes(version)) {
+  for (const version of normalizedHostSupportedVersions) {
+    if (normalizedPeerSupportedVersions.includes(version)) {
       return {
         acceptedVersion: version,
         exact: false,
@@ -388,127 +405,307 @@ function resolveNegotiatedVersion(preferredVersion: string, hostSupportedVersion
 
   return {
     exact: false,
-    reason: `No overlapping supported versions. host=[${hostSupportedVersions.join(', ')}]; peer=[${peerSupportedVersions.join(', ')}].`,
+    reason: `No overlapping supported versions. host=[${normalizedHostSupportedVersions.join(', ')}]; peer=[${normalizedPeerSupportedVersions.join(', ')}].`,
   }
 }
 
-export type PluginRuntime = 'electron' | 'node' | 'web'
+function filterDeniedPermissions(requested: ModulePermissionDeclaration, granted: ModulePermissionGrant): ModulePermissionDeclaration {
+  const denied: ModulePermissionDeclaration = {}
+  const deniedApis = filterDeniedPermissionScopes(requested.apis, granted.apis)
+  const deniedResources = filterDeniedPermissionScopes(requested.resources, granted.resources)
+  const deniedCapabilities = filterDeniedPermissionScopes(requested.capabilities, granted.capabilities)
+  const deniedProcessors = filterDeniedPermissionScopes(requested.processors, granted.processors)
+  const deniedPipelines = filterDeniedPermissionScopes(requested.pipelines, granted.pipelines)
 
-export type ModulePhase = ProtocolModulePhase
-
-export type PluginSessionPhase
-  = | 'loading'
-    | 'loaded'
-    | 'authenticating'
-    | 'authenticated'
-    | 'waiting-deps'
-    | ModulePhase
-    | 'stopped'
-
-export type PluginIdentity = ProtocolPluginIdentity
-
-export type ModuleIdentity = ProtocolModuleIdentity
-
-export type ModuleConfigEnvelope<C = Record<string, unknown>> = ProtocolModuleConfigEnvelope<C>
-
-export type ModuleCompatibilityRequest = ProtocolEvents['module:compatibility:request']
-
-export type ModuleCompatibilityResult = ProtocolEvents['module:compatibility:result']
-
-export interface ManifestV1 {
-  apiVersion: 'v1'
-  kind: 'manifest.plugin.airi.moeru.ai'
-  name: string
-  entrypoints: {
-    default?: string
-    electron?: string
-    node?: string
-    web?: string
+  if (deniedApis.length > 0) {
+    denied.apis = deniedApis
   }
-}
 
-export const manifestV1Schema = object({
-  apiVersion: literal('v1'),
-  kind: literal('manifest.plugin.airi.moeru.ai'),
-  name: string(),
-  entrypoints: object({
-    default: optional(string()),
-    electron: optional(string()),
-    node: optional(string()),
-    web: optional(string()),
-  }),
-})
-
-export interface PluginLoadOptions {
-  cwd?: string
-  runtime?: PluginRuntime
-}
-
-export interface PluginHostOptions {
-  runtime?: PluginRuntime
-  transport?: PluginTransport
-  protocolVersion?: string
-  apiVersion?: string
-  supportedProtocolVersions?: string[]
-  supportedApiVersions?: string[]
-}
-
-export interface PluginStartOptions {
-  cwd?: string
-  runtime?: PluginRuntime
-  requireConfiguration?: boolean
-  compatibility?: Omit<ModuleCompatibilityRequest, 'protocolVersion' | 'apiVersion'>
-  requiredCapabilities?: string[]
-  capabilityWaitTimeoutMs?: number
-}
-
-export interface PluginHostSession {
-  manifest: ManifestV1
-  plugin: Plugin
-  id: string
-  index: number
-  cwd: string
-  identity: ModuleIdentity
-  phase: PluginSessionPhase
-  lifecycle: ActorRefFrom<typeof pluginLifecycleMachine>
-  transport: PluginTransport
-  runtime: PluginRuntime
-  channels: {
-    host: ReturnType<typeof createPluginContext>
+  if (deniedResources.length > 0) {
+    denied.resources = deniedResources
   }
-  apis: ReturnType<typeof createApis>
+
+  if (deniedCapabilities.length > 0) {
+    denied.capabilities = deniedCapabilities
+  }
+
+  if (deniedProcessors.length > 0) {
+    denied.processors = deniedProcessors
+  }
+
+  if (deniedPipelines.length > 0) {
+    denied.pipelines = deniedPipelines
+  }
+
+  return denied
+}
+
+function matchPermissionKey(pattern: string, target: string) {
+  if (pattern === '*') {
+    return true
+  }
+
+  if (pattern.endsWith('*')) {
+    return target.startsWith(pattern.slice(0, -1))
+  }
+
+  return pattern === target
+}
+
+function getPermissionIntersectionKey(left: string, right: string) {
+  if (matchPermissionKey(left, right)) {
+    return right
+  }
+
+  if (matchPermissionKey(right, left)) {
+    return left
+  }
+
+  return undefined
+}
+
+function filterDeniedPermissionScopes<
+  T extends {
+    key: string
+    actions: string[]
+  },
+>(requested: T[] | undefined, granted: T[] | undefined): T[] {
+  if (!requested?.length) {
+    return []
+  }
+
+  return requested.flatMap((requestedSpec) => {
+    const grantedActions = new Set<string>()
+    let hasUnRepresentableOverlap = false
+
+    for (const grantedSpec of granted ?? []) {
+      const intersectionKey = getPermissionIntersectionKey(requestedSpec.key, grantedSpec.key)
+      if (!intersectionKey) {
+        continue
+      }
+
+      if (intersectionKey !== requestedSpec.key) {
+        // A narrower grant overlaps only part of the requested scope, such as:
+        // - requested `plugin.resource.*`
+        // - granted   `plugin.resource.settings`
+        //
+        // The current declaration shape cannot express "everything except the granted subset",
+        // so reporting the whole requested scope as denied would contradict the granted/current
+        // snapshots. In that case we omit the denied entry rather than over-reporting it.
+        hasUnRepresentableOverlap = true
+        continue
+      }
+
+      for (const action of grantedSpec.actions) {
+        if (requestedSpec.actions.includes(action)) {
+          grantedActions.add(action)
+        }
+      }
+    }
+
+    const deniedActions = requestedSpec.actions.filter(action => !grantedActions.has(action))
+    if (deniedActions.length === 0 || hasUnRepresentableOverlap) {
+      return []
+    }
+
+    return [{
+      ...requestedSpec,
+      actions: deniedActions,
+    }]
+  })
+}
+
+class PermissionDeniedError extends Error {
+  readonly details: {
+    area: 'apis' | 'resources' | 'capabilities' | 'processors' | 'pipelines'
+    action: string
+    key: string
+  }
+
+  constructor(details: PermissionDeniedError['details']) {
+    super(`Permission denied: ${details.area}.${details.action} "${details.key}"`)
+    this.name = 'PermissionDeniedError'
+    this.details = details
+  }
 }
 
 /**
- * In-memory Plugin Host MVP.
+ * Describes the host-owned state tracked for one plugin session.
  *
- * Procedure placement:
- * - `load(...)` covers step 0 and step 1 preparation:
- *   - create channel gateway/context
- *   - prepare per-plugin isolated runtime resources
- *   - load plugin module from manifest entrypoint
- * - `init(...)` covers protocol/lifecycle step 2 onwards:
- *   - authentication
- *   - compatibility negotiation
- *   - registry sync + announce/prepare/configure/ready flow
+ * Use when:
+ * - Reading session snapshots from `PluginHost`
+ * - Passing session state through host tests or orchestration code
  *
- * The design intentionally keeps `load` and `init` separate so callers can:
- * - inspect/patch session state before booting,
- * - batch-load many plugins first, then initialize deterministically.
+ * Expects:
+ * - `id` and `identity` stay stable for the lifetime of the session
+ *
+ * Returns:
+ * - The full session snapshot including transport, phase, bound APIs, and granted permissions
+ */
+export interface PluginHostSession {
+  /** Manifest used to load the plugin. */
+  manifest: ManifestV1
+  /** Loaded plugin hooks for the active session. */
+  plugin: Plugin
+  /** Unique host-generated session id. */
+  id: string
+  /** Monotonic index assigned when the session was created. */
+  index: number
+  /** Working directory used to resolve relative entrypoints. */
+  cwd: string
+  /** Protocol identity emitted on plugin lifecycle events. */
+  identity: ModuleIdentity
+  /** Current host lifecycle phase for the session. */
+  phase: PluginSessionPhase
+  /** XState actor that drives the session lifecycle transitions. */
+  lifecycle: ActorRefFrom<typeof pluginLifecycleMachine>
+  /** Transport used by the session Eventa context. */
+  transport: PluginTransport
+  /** Runtime used to load and run the plugin. */
+  runtime: PluginRuntime
+  /** Host-owned Eventa channels injected into the plugin context. */
+  channels: {
+    /** Control-plane Eventa context used for lifecycle and RPC traffic. */
+    host: ReturnType<typeof createPluginContext>
+  }
+  /** Bound plugin SDK APIs exposed to plugin code. */
+  apis: PluginHostSessionApis
+  /** Requested and granted permissions for the session. */
+  permissions: {
+    /** Permissions requested by the manifest and runtime declarations. */
+    requested: ModulePermissionDeclaration
+    /** Permissions actually granted by the host. */
+    granted: ModulePermissionGrant
+    /** Permission snapshot revision number. */
+    revision: number
+  }
+}
+
+/**
+ * Filters the binding list returned by `PluginHost.listBindings(...)`.
+ *
+ * Use when:
+ * - Narrowing the host binding snapshot by owner session or kit
+ *
+ * Expects:
+ * - Omitted fields mean "do not filter by this dimension"
+ *
+ * Returns:
+ * - Optional filter criteria for the in-memory binding registry
+ */
+export interface PluginHostBindingListOptions {
+  /** Limit results to bindings owned by one plugin session. */
+  ownerSessionId?: string
+  /** Limit results to bindings declared against one kit. */
+  kitId?: string
+}
+
+type BoundAnnounceBindingInput<C extends HostDataRecord = HostDataRecord> = AnnounceBindingInput<C>
+type BoundUpdateBindingInput<C extends HostDataRecord = HostDataRecord> = UpdateBindingInput<C>
+
+const builtInSessionApiNamespaces = new Set(['providers', 'kits', 'bindings', 'tools'])
+
+type PluginHostSessionApis = ReturnType<typeof createApis> & Record<string, unknown>
+
+function omitModuleId<C extends HostDataRecord>(input: BoundUpdateBindingInput<C>) {
+  return {
+    state: input.state,
+    config: input.config,
+  }
+}
+
+function cloneHostDataValue<T extends HostDataValue>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map(item => cloneHostDataValue(item)) as T
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, cloneHostDataValue(item as HostDataValue)]),
+    ) as T
+  }
+
+  return value
+}
+
+function cloneHostDataRecord<T extends HostDataRecord>(record: T): T {
+  return cloneHostDataValue(record)
+}
+
+function cloneKitCapabilities(capabilities: KitCapabilityDescriptor[]): KitCapabilityDescriptor[] {
+  return capabilities.map(capability => ({
+    key: capability.key,
+    actions: [...capability.actions],
+  }))
+}
+
+function cloneKitDescriptor<TKit extends KitDescriptor>(kit: TKit): TKit {
+  return {
+    ...kit,
+    runtimes: [...kit.runtimes],
+    capabilities: cloneKitCapabilities(kit.capabilities),
+  }
+}
+
+function cloneBindingRecord<C extends HostDataRecord>(module: BindingRecord<C>): BindingRecord<C> {
+  return {
+    ...module,
+    config: cloneHostDataRecord(module.config),
+  }
+}
+
+/**
+ * Orchestrates plugin loading, session lifecycle, bindings, tools, resources, and permissions.
+ *
+ * Use when:
+ * - Running plugins inside the in-memory host implementation
+ * - Tests or applications need one place to load, initialize, start, stop, and query plugin sessions
+ *
+ * Expects:
+ * - Plugins are loaded from manifest entrypoints through {@link FileSystemLoader}
+ * - Each session gets its own Eventa context, permission scope, and lifecycle actor
+ *
+ * Returns:
+ * - A host instance that exposes session management plus access to kits, bindings, tools, and capabilities
+ *
+ * Call stack:
+ *
+ * caller
+ *   -> {@link PluginHost.load}
+ *     -> {@link FileSystemLoader.resolveEntrypointFor}
+ *     -> {@link FileSystemLoader.loadPluginFor}
+ *   -> {@link PluginHost.init}
+ *     -> permission resolution + protocol negotiation
+ *     -> binding of {@link createApis} into plugin context
+ *   -> {@link PluginHost.start}
+ *     -> {@link PluginHost.load}
+ *     -> {@link PluginHost.init}
  */
 export class PluginHost {
   private readonly loader: FileSystemLoader
-  private readonly sessions = new Map<string, PluginHostSession>()
+  private readonly sessionService = new PluginSessionService<PluginHostSession>()
   private readonly runtime: PluginRuntime
   private readonly transport: PluginTransport
   private readonly protocolVersion: string
   private readonly apiVersion: string
   private readonly supportedProtocolVersions: string[]
   private readonly supportedApiVersions: string[]
-  private readonly capabilities = new Map<string, CapabilityDescriptor>()
-  private readonly capabilityWaiters = new Map<string, Set<(descriptor: CapabilityDescriptor) => void>>()
-  private providersListResolver: () => Promise<Array<{ name: string }>> | Array<{ name: string }> = () => []
-  private sessionCounter = 0
+  private readonly dependencies = new DependencyService()
+  private readonly kits = new KitRegistryService()
+  private readonly modules = new BindingsRegistryService()
+  private readonly tools = new ToolRegistryService()
+  private readonly permissions = new PermissionService()
+  private readonly permissionResolver?: PluginHostOptions['permissionResolver']
+  private readonly persistedPermissionGrants = new Map<string, ModulePermissionGrant>()
+  private readonly resources = new ResourceService()
+  private readonly sessionApiFactories = new Map<string, PluginSessionApiFactory>()
+  private readonly lifecycleHooks: Record<PluginHostLifecycleEvent, PluginHostLifecycleHook[]> = {
+    'session-loaded': [],
+    'session-ready': [],
+    'session-stopped': [],
+  }
+
+  private readonly installContext: PluginHostInstallContext
 
   constructor(options: PluginHostOptions = {}) {
     this.loader = new FileSystemLoader()
@@ -518,15 +715,466 @@ export class PluginHost {
     this.apiVersion = options.apiVersion ?? 'v1'
     this.supportedProtocolVersions = resolveSupportedVersions(this.protocolVersion, options.supportedProtocolVersions)
     this.supportedApiVersions = resolveSupportedVersions(this.apiVersion, options.supportedApiVersions)
+    this.permissionResolver = options.permissionResolver
+    this.resources.setValue(protocolListProvidersEventName, [] as Array<{ name: string }>)
     this.markCapabilityReady(protocolListProvidersEventName, { source: 'plugin-host' })
+    this.installContext = this.createInstallContext()
+
+    for (const contribution of options.contributions ?? []) {
+      this.installContribution(contribution)
+    }
+  }
+
+  private getPermissionScopeKey(session: PluginHostSession) {
+    return session.id
+  }
+
+  private assertPermission(
+    session: PluginHostSession,
+    input: PluginHostPermissionRequest,
+  ) {
+    const allowed = this.permissions.isAllowed(this.getPermissionScopeKey(session), input.area, input.action, input.key)
+    if (allowed) {
+      return
+    }
+
+    const error = new PermissionDeniedError({
+      area: input.area,
+      action: input.action,
+      key: input.key,
+    })
+
+    session.channels.host.emit(errorPermission, {
+      identity: session.identity,
+      error: {
+        area: input.area,
+        action: input.action,
+        key: input.key,
+        reason: input.reason ?? 'Permission not granted for requested operation.',
+        recoverable: true,
+      },
+    })
+
+    throw error
+  }
+
+  private getSessionOrThrow(sessionId: string) {
+    const session = this.sessionService.get(sessionId)
+    if (!session) {
+      throw new Error(`Unknown plugin session: ${sessionId}`)
+    }
+
+    return session
+  }
+
+  private createSessionContext(session: PluginHostSession): PluginHostSessionContext {
+    return {
+      sessionId: session.id,
+      ownerPluginId: session.identity.plugin.id,
+      runtime: session.runtime,
+    }
+  }
+
+  private createInstallContext(): PluginHostInstallContext {
+    return {
+      registerSessionApi: (namespace, factory) => {
+        if (builtInSessionApiNamespaces.has(namespace)) {
+          throw new Error(`Session API namespace \`${namespace}\` is reserved by PluginHost.`)
+        }
+
+        const currentFactory = this.sessionApiFactories.get(namespace)
+        if (currentFactory && currentFactory !== factory) {
+          throw new Error(`Duplicate session API namespace registration for \`${namespace}\`.`)
+        }
+
+        this.sessionApiFactories.set(namespace, factory)
+      },
+      registerLifecycleHook: (event, hook) => {
+        this.lifecycleHooks[event].push(hook)
+      },
+      registerKit: kit => this.registerKit(kit),
+      unregisterKit: kitId => this.unregisterKit(kitId),
+      setResourceResolver: (key, resolver) => this.setResourceResolver(key, resolver),
+      setResourceValue: (key, value) => this.setResourceValue(key, value),
+      announceCapability: (key, metadata) => {
+        this.announceCapability(key, metadata)
+      },
+      markCapabilityReady: (key, metadata) => {
+        this.markCapabilityReady(key, metadata)
+      },
+      markCapabilityDegraded: (key, metadata) => {
+        this.markCapabilityDegraded(key, metadata)
+      },
+      withdrawCapability: (key, metadata) => {
+        this.withdrawCapability(key, metadata)
+      },
+    }
+  }
+
+  private installContribution(contribution: PluginHostContribution) {
+    contribution.install(this.installContext)
+  }
+
+  private createSessionApis(
+    session: PluginHostSession,
+    hostChannel: ReturnType<typeof createPluginContext>,
+  ): PluginHostSessionApis {
+    const baseApis = createBoundApis(hostChannel, {
+      kits: {
+        list: () => {
+          this.assertPermission(session, {
+            area: 'apis',
+            action: 'invoke',
+            key: pluginKitApiListEventName,
+          })
+          this.assertPermission(session, {
+            area: 'resources',
+            action: 'read',
+            key: pluginKitRegistryResourceKey,
+          })
+
+          return this.listKits(session.runtime)
+        },
+        getCapabilities: (kitId) => {
+          this.assertPermission(session, {
+            area: 'apis',
+            action: 'invoke',
+            key: pluginKitApiGetCapabilitiesEventName,
+          })
+          this.assertPermission(session, {
+            area: 'resources',
+            action: 'read',
+            key: pluginKitRegistryResourceKey,
+          })
+          this.assertKitAvailableForSession(session, kitId)
+
+          return this.getKitCapabilities(kitId)
+        },
+      },
+      bindings: {
+        list: () => {
+          this.assertPermission(session, {
+            area: 'apis',
+            action: 'invoke',
+            key: pluginBindingApiListEventName,
+          })
+          this.assertPermission(session, {
+            area: 'resources',
+            action: 'read',
+            key: pluginBindingRegistryResourceKey,
+          })
+
+          return this.listBindings({ ownerSessionId: session.id })
+        },
+        announce: input => this.announceBinding(session.id, input),
+        activate: input => this.activateBinding(session.id, input.moduleId),
+        update: input => this.updateBinding(session.id, input.moduleId, input),
+        withdraw: input => this.withdrawBinding(session.id, input.moduleId),
+      },
+      tools: {
+        register: input => this.registerTool(session.id, input),
+      },
+    })
+
+    const contributionApis = Object.fromEntries(
+      [...this.sessionApiFactories.entries()].map(([namespace, factory]) => [
+        namespace,
+        factory({
+          host: this.installContext,
+          session: this.createSessionContext(session),
+          assertPermission: input => this.assertPermission(session, input),
+        }),
+      ]),
+    )
+
+    return {
+      ...baseApis,
+      ...contributionApis,
+    }
+  }
+
+  private runLifecycleHooks(event: PluginHostLifecycleEvent, session: PluginHostSession) {
+    for (const hook of this.lifecycleHooks[event]) {
+      hook({
+        host: this.installContext,
+        session: this.createSessionContext(session),
+        manifest: session.manifest,
+      })
+    }
+  }
+
+  private cleanupSession(session: PluginHostSession) {
+    let lifecycleHookError: unknown
+
+    if (session.phase !== 'stopped') {
+      const canStop = session.lifecycle.getSnapshot().can({ type: 'STOP' })
+      if (canStop) {
+        assertTransition(session, 'stopped')
+      }
+      else {
+        session.phase = 'stopped'
+      }
+    }
+
+    for (const module of this.modules.listByOwner(session.id)) {
+      this.modules.withdraw(session.id, session.identity.plugin.id, module.moduleId)
+      this.modules.unbind(session.id, session.identity.plugin.id, module.moduleId)
+    }
+
+    try {
+      this.runLifecycleHooks('session-stopped', session)
+    }
+    catch (error) {
+      lifecycleHookError = error
+    }
+
+    session.lifecycle.stop()
+    this.sessionService.remove(session.id)
+
+    return lifecycleHookError
+  }
+
+  private getModuleOrThrow(moduleId: string) {
+    const module = this.modules.get(moduleId)
+    if (!module) {
+      throw new Error(`Module \`${moduleId}\` was not found.`)
+    }
+
+    return module
+  }
+
+  private assertKitAvailableForSession(session: PluginHostSession, kitId: string) {
+    const kit = this.kits.get(kitId)
+    if (!kit) {
+      throw new Error(`Kit \`${kitId}\` is not registered.`)
+    }
+
+    if (!kit.runtimes.includes(session.runtime)) {
+      throw new Error(`Kit \`${kitId}\` is not available for runtime \`${session.runtime}\`.`)
+    }
+
+    return kit
   }
 
   listSessions() {
-    return [...this.sessions.values()]
+    return this.sessionService.list()
   }
 
   getSession(sessionId: string) {
-    return this.sessions.get(sessionId)
+    return this.sessionService.get(sessionId)
+  }
+
+  registerKit(kit: KitDescriptor) {
+    return this.kits.register(kit)
+  }
+
+  unregisterKit(kitId: string) {
+    return this.kits.remove(kitId)
+  }
+
+  getKit(kitId: string) {
+    const kit = this.kits.get(kitId)
+    if (!kit) {
+      return undefined
+    }
+
+    return cloneKitDescriptor(kit)
+  }
+
+  listKits(runtime?: PluginRuntime) {
+    const kits = runtime
+      ? this.kits.listByRuntime(runtime)
+      : this.kits.list()
+
+    return kits.map(kit => cloneKitDescriptor(kit))
+  }
+
+  getKitCapabilities(kitId: string): KitCapabilityDescriptor[] {
+    const capabilities = this.kits.get(kitId)?.capabilities
+    if (!capabilities) {
+      return []
+    }
+
+    return cloneKitCapabilities(capabilities)
+  }
+
+  getBinding(moduleId: string): BindingRecord<HostDataRecord> | undefined {
+    const module = this.modules.get(moduleId)
+    if (!module) {
+      return undefined
+    }
+
+    return cloneBindingRecord(module)
+  }
+
+  listBindings(options: PluginHostBindingListOptions = {}) {
+    return this.modules.list().filter((module) => {
+      if (options.ownerSessionId && module.ownerSessionId !== options.ownerSessionId) {
+        return false
+      }
+
+      if (options.kitId && module.kitId !== options.kitId) {
+        return false
+      }
+
+      return true
+    }).map(module => cloneBindingRecord(module))
+  }
+
+  async listAvailableToolDescriptors() {
+    return await this.tools.listAvailableDescriptors()
+  }
+
+  async listSerializedXsaiTools() {
+    return await this.tools.listSerializedXsaiTools()
+  }
+
+  async invokeTool(ownerPluginId: string, toolId: string, input: unknown) {
+    return await this.tools.invoke(ownerPluginId, toolId, input)
+  }
+
+  announceBinding<C extends HostDataRecord = HostDataRecord>(
+    sessionId: string,
+    input: BoundAnnounceBindingInput<C>,
+  ): BindingRecord<C> {
+    const session = this.getSessionOrThrow(sessionId)
+    const kit = this.assertKitAvailableForSession(session, input.kitId)
+
+    this.assertPermission(session, {
+      area: 'apis',
+      action: 'invoke',
+      key: pluginBindingApiAnnounceEventName,
+    })
+    this.assertPermission(session, {
+      area: 'resources',
+      action: 'write',
+      key: getKitBindingResourceKey(kit.kitId),
+      reason: `Module announce requires write access to kit \`${kit.kitId}\`.`,
+    })
+
+    return cloneBindingRecord(this.modules.bind({
+      ...input,
+      ownerSessionId: session.id,
+      ownerPluginId: session.identity.plugin.id,
+      runtime: session.runtime,
+    }) as BindingRecord<C>)
+  }
+
+  activateBinding(sessionId: string, moduleId: string) {
+    const session = this.getSessionOrThrow(sessionId)
+    const module = this.getModuleOrThrow(moduleId)
+
+    this.assertPermission(session, {
+      area: 'apis',
+      action: 'invoke',
+      key: pluginBindingApiActivateEventName,
+    })
+    this.assertPermission(session, {
+      area: 'resources',
+      action: 'write',
+      key: getKitBindingResourceKey(module.kitId),
+      reason: `Module activation requires write access to kit \`${module.kitId}\`.`,
+    })
+
+    return cloneBindingRecord(this.modules.activate(session.id, session.identity.plugin.id, moduleId))
+  }
+
+  updateBinding<C extends HostDataRecord = HostDataRecord>(
+    sessionId: string,
+    moduleId: string,
+    patch: UpdateBindingInput<C> | Omit<UpdateBindingInput<C>, 'moduleId'>,
+  ) {
+    const session = this.getSessionOrThrow(sessionId)
+    const module = this.getModuleOrThrow(moduleId)
+
+    this.assertPermission(session, {
+      area: 'apis',
+      action: 'invoke',
+      key: pluginBindingApiUpdateEventName,
+    })
+    this.assertPermission(session, {
+      area: 'resources',
+      action: 'write',
+      key: getKitBindingResourceKey(module.kitId),
+      reason: `Module update requires write access to kit \`${module.kitId}\`.`,
+    })
+
+    const normalizedPatch = 'moduleId' in patch ? omitModuleId(patch) : patch
+    return cloneBindingRecord(this.modules.update(session.id, session.identity.plugin.id, moduleId, normalizedPatch))
+  }
+
+  degradeBinding(sessionId: string, moduleId: string) {
+    const session = this.getSessionOrThrow(sessionId)
+    const module = this.getModuleOrThrow(moduleId)
+    this.assertPermission(session, {
+      area: 'resources',
+      action: 'write',
+      key: getKitBindingResourceKey(module.kitId),
+      reason: `Module degradation requires write access to kit \`${module.kitId}\`.`,
+    })
+
+    return cloneBindingRecord(this.modules.degrade(session.id, session.identity.plugin.id, moduleId))
+  }
+
+  withdrawBinding(sessionId: string, moduleId: string) {
+    const session = this.getSessionOrThrow(sessionId)
+    const module = this.getModuleOrThrow(moduleId)
+
+    this.assertPermission(session, {
+      area: 'apis',
+      action: 'invoke',
+      key: pluginBindingApiWithdrawEventName,
+    })
+    this.assertPermission(session, {
+      area: 'resources',
+      action: 'write',
+      key: getKitBindingResourceKey(module.kitId),
+      reason: `Module withdrawal requires write access to kit \`${module.kitId}\`.`,
+    })
+
+    return cloneBindingRecord(this.modules.withdraw(session.id, session.identity.plugin.id, moduleId))
+  }
+
+  registerTool(sessionId: string, input: RegisterToolInput) {
+    const session = this.getSessionOrThrow(sessionId)
+
+    this.assertPermission(session, {
+      area: 'apis',
+      action: 'invoke',
+      key: pluginToolApiRegisterEventName,
+    })
+    this.assertPermission(session, {
+      area: 'resources',
+      action: 'write',
+      key: pluginToolRegistryResourceKey,
+    })
+
+    this.tools.register({
+      ownerSessionId: session.id,
+      ownerPluginId: session.identity.plugin.id,
+      tool: {
+        ...input.tool,
+        activation: {
+          keywords: [...input.tool.activation.keywords],
+          patterns: [...input.tool.activation.patterns],
+        },
+        parameters: cloneHostDataRecord(input.tool.parameters),
+      },
+      availability: async () => {
+        if (!this.getSession(session.id)) {
+          return false
+        }
+
+        return await input.availability?.() ?? true
+      },
+      execute: async (toolInput) => {
+        if (!this.getSession(session.id)) {
+          throw new Error(`Plugin tool not found: ${session.identity.plugin.id}:${input.tool.id}`)
+        }
+
+        return await input.execute(toolInput)
+      },
+    })
   }
 
   async load(manifest: ManifestV1, options: PluginLoadOptions = {}): Promise<PluginHostSession> {
@@ -542,28 +1190,25 @@ export class PluginHost {
       throw new Error(`Only in-memory transport is currently supported by PluginHost alpha. Got: ${transport.kind}`)
     }
 
-    // Build deterministic per-session identity.
-    // `sessionCounter` gives stable ordering for registry sync and debugging.
-    const sessionIndex = this.sessionCounter
-    this.sessionCounter += 1
-
-    const id = `plugin-session-${sessionIndex}`
-    const identity = createModuleIdentity(manifest.name, sessionIndex)
+    // Build per-session identity.
+    const sessionIdentity = this.sessionService.nextSessionIdentity(manifest.name)
+    const sessionIndex = sessionIdentity.index
+    const id = sessionIdentity.sessionId
+    const identity = sessionIdentity.moduleIdentity
 
     // Step 1 (connect/control-plane prep): create an isolated Eventa context per plugin.
     // All invokes/events for this plugin go through this context to prevent cross-talk.
     const hostChannel = createPluginContext(transport)
     const lifecycle = createActor(pluginLifecycleMachine)
     lifecycle.start()
-    defineInvokeHandler(hostChannel, protocolCapabilityWait, async (payload) => {
-      return await this.waitForCapability(payload.key, payload?.timeoutMs)
-    })
-    defineInvokeHandler(hostChannel, protocolCapabilitySnapshot, async () => {
-      return this.listCapabilities()
-    })
-    defineInvokeHandler(hostChannel, protocolProviders.listProviders, async () => {
-      return await this.providersListResolver()
-    })
+
+    const permissionSnapshot = this.permissions.initialize(
+      id,
+      manifest.permissions,
+      {
+        persisted: this.persistedPermissionGrants.get(identity.plugin.id),
+      },
+    )
 
     const session: PluginHostSession = {
       manifest,
@@ -579,11 +1224,57 @@ export class PluginHost {
       channels: {
         host: hostChannel,
       },
-      apis: createBoundApis(hostChannel),
+      apis: {} as PluginHostSessionApis,
+      permissions: {
+        requested: permissionSnapshot.requested,
+        granted: permissionSnapshot.granted,
+        revision: permissionSnapshot.revision,
+      },
     }
+    session.apis = this.createSessionApis(session, hostChannel)
+
+    defineInvokeHandler(hostChannel, protocolCapabilityWait, async (payload) => {
+      this.assertPermission(session, {
+        area: 'apis',
+        action: 'invoke',
+        key: protocolCapabilityWaitEventName,
+      })
+      this.assertPermission(session, {
+        area: 'capabilities',
+        action: 'wait',
+        key: payload.key,
+      })
+      return await this.waitForCapability(payload.key, payload?.timeoutMs)
+    })
+    defineInvokeHandler(hostChannel, protocolCapabilitySnapshot, async () => {
+      this.assertPermission(session, {
+        area: 'apis',
+        action: 'invoke',
+        key: protocolCapabilitySnapshotEventName,
+      })
+      this.assertPermission(session, {
+        area: 'capabilities',
+        action: 'snapshot',
+        key: '*',
+      })
+      return this.listCapabilities()
+    })
+    defineInvokeHandler(hostChannel, protocolProviders.listProviders, async () => {
+      this.assertPermission(session, {
+        area: 'apis',
+        action: 'invoke',
+        key: protocolListProvidersEventName,
+      })
+      this.assertPermission(session, {
+        area: 'resources',
+        action: 'read',
+        key: protocolListProvidersEventName,
+      })
+      return await this.resources.get<Array<{ name: string }>>(protocolListProvidersEventName, []) ?? []
+    })
 
     // Register session before loading so failure paths still have observable state.
-    this.sessions.set(id, session)
+    this.sessionService.register(session)
 
     try {
       // Load plugin module from manifest-selected runtime entrypoint.
@@ -596,6 +1287,7 @@ export class PluginHost {
       // Assert lifecycle progression (`loading` -> `loaded`) to keep transition rules explicit.
       // This prevents accidental phase drift if the method evolves later.
       assertTransition(session, 'loaded')
+      this.runLifecycleHooks('session-loaded', session)
       return session
     }
     catch (error) {
@@ -614,7 +1306,7 @@ export class PluginHost {
 
   async init(sessionId: string, options: PluginStartOptions = {}): Promise<PluginHostSession> {
     // `init` starts at procedure step 2 (authenticate) and drives lifecycle to ready.
-    const session = this.sessions.get(sessionId)
+    const session = this.sessionService.get(sessionId)
     if (!session) {
       throw new Error(`Unable to initialize plugin session: ${sessionId}`)
     }
@@ -690,12 +1382,58 @@ export class PluginHost {
           })),
       })
 
+      session.channels.host.emit(modulePermissionsDeclare, {
+        identity: session.identity,
+        requested: session.permissions.requested,
+        source: 'manifest',
+      })
+
+      const resolvedGrant = await this.permissionResolver?.({
+        identity: session.identity,
+        manifest: session.manifest,
+        requested: session.permissions.requested,
+        persisted: this.persistedPermissionGrants.get(session.identity.plugin.id),
+      }) ?? session.permissions.requested
+
+      const grantedSnapshot = this.permissions.initialize(this.getPermissionScopeKey(session), session.permissions.requested, {
+        grant: resolvedGrant,
+        persisted: this.persistedPermissionGrants.get(session.identity.plugin.id),
+      })
+      session.permissions = {
+        requested: grantedSnapshot.requested,
+        granted: grantedSnapshot.granted,
+        revision: grantedSnapshot.revision,
+      }
+      this.persistedPermissionGrants.set(session.identity.plugin.id, grantedSnapshot.granted)
+
+      const deniedPermissions = filterDeniedPermissions(grantedSnapshot.requested, grantedSnapshot.granted)
+      session.channels.host.emit(modulePermissionsGranted, {
+        identity: session.identity,
+        granted: grantedSnapshot.granted,
+        revision: grantedSnapshot.revision,
+      })
+      if (Object.values(deniedPermissions).some(value => Array.isArray(value) && value.length > 0)) {
+        session.channels.host.emit(modulePermissionsDenied, {
+          identity: session.identity,
+          denied: deniedPermissions,
+          reason: 'One or more requested permissions were not granted by host policy.',
+          revision: grantedSnapshot.revision,
+        })
+      }
+      session.channels.host.emit(modulePermissionsCurrent, {
+        identity: session.identity,
+        requested: grantedSnapshot.requested,
+        granted: grantedSnapshot.granted,
+        revision: grantedSnapshot.revision,
+      })
+
       // Step 5: module announcement to the shared control plane.
       assertTransition(session, 'announced')
       session.channels.host.emit(moduleAnnounce, {
         name: session.manifest.name,
         identity: session.identity,
         possibleEvents: [],
+        permissions: session.permissions.requested,
       })
       session.channels.host.emit(moduleStatus, {
         identity: session.identity,
@@ -796,6 +1534,7 @@ export class PluginHost {
         identity: session.identity,
         phase: 'ready',
       })
+      this.runLifecycleHooks('session-ready', session)
 
       return session
     }
@@ -808,6 +1547,8 @@ export class PluginHost {
         phase: 'failed',
         reason: error instanceof Error ? error.message : 'Plugin host initialization failed.',
       })
+
+      this.cleanupSession(session)
 
       throw error
     }
@@ -826,7 +1567,7 @@ export class PluginHost {
 
   async applyConfiguration(sessionId: string, config: ModuleConfigEnvelope) {
     // Configuration is allowed only after prepare, during configuration-needed, or while re-configuring.
-    const session = this.sessions.get(sessionId)
+    const session = this.sessionService.get(sessionId)
     if (!session) {
       throw new Error(`Unable to configure plugin session: ${sessionId}`)
     }
@@ -854,117 +1595,117 @@ export class PluginHost {
     return session
   }
 
-  setProvidersListResolver(resolver: () => Promise<Array<{ name: string }>> | Array<{ name: string }>) {
-    this.providersListResolver = resolver
-    this.markCapabilityReady(protocolListProvidersEventName, { source: 'plugin-host-override' })
+  requestPermissions(sessionId: string, requested: ModulePermissionDeclaration, reason?: string) {
+    const session = this.sessionService.get(sessionId)
+    if (!session) {
+      throw new Error(`Unable to request permissions for plugin session: ${sessionId}`)
+    }
+
+    const snapshot = this.permissions.declare(this.getPermissionScopeKey(session), requested)
+    session.permissions = {
+      requested: snapshot.requested,
+      granted: snapshot.granted,
+      revision: snapshot.revision,
+    }
+
+    session.channels.host.emit(modulePermissionsDeclare, {
+      identity: session.identity,
+      requested: snapshot.requested,
+      source: 'runtime',
+    })
+    session.channels.host.emit(modulePermissionsCurrent, {
+      identity: session.identity,
+      requested: snapshot.requested,
+      granted: snapshot.granted,
+      revision: snapshot.revision,
+    })
+    session.channels.host.emit(modulePermissionsRequest, {
+      identity: session.identity,
+      requested: snapshot.requested,
+      reason,
+    })
+  }
+
+  grantPermissions(
+    sessionId: string,
+    grant: ModulePermissionGrant,
+  ): {
+    requested: ModulePermissionDeclaration
+    granted: ModulePermissionGrant
+    revision: number
+  } {
+    const session = this.sessionService.get(sessionId)
+    if (!session) {
+      throw new Error(`Unable to grant permissions for plugin session: ${sessionId}`)
+    }
+
+    const snapshot = this.permissions.grant(this.getPermissionScopeKey(session), grant)
+    session.permissions = {
+      requested: snapshot.requested,
+      granted: snapshot.granted,
+      revision: snapshot.revision,
+    }
+    this.persistedPermissionGrants.set(session.identity.plugin.id, snapshot.granted)
+
+    session.channels.host.emit(modulePermissionsGranted, {
+      identity: session.identity,
+      granted: snapshot.granted,
+      revision: snapshot.revision,
+    })
+    session.channels.host.emit(modulePermissionsCurrent, {
+      identity: session.identity,
+      requested: snapshot.requested,
+      granted: snapshot.granted,
+      revision: snapshot.revision,
+    })
+
+    return snapshot
+  }
+
+  setResourceResolver<T>(key: string, resolver: () => Promise<T> | T) {
+    this.resources.setResolver(key, resolver)
+  }
+
+  setResourceValue<T>(key: string, value: T) {
+    this.resources.setValue(key, value)
   }
 
   announceCapability(key: string, metadata?: Record<string, unknown>) {
-    const current = this.capabilities.get(key)
-    const descriptor: CapabilityDescriptor = {
-      key,
-      state: 'announced',
-      metadata: metadata ?? current?.metadata,
-      updatedAt: Date.now(),
-    }
-
-    this.capabilities.set(key, descriptor)
-    return descriptor
+    return this.dependencies.announce(key, metadata)
   }
 
   markCapabilityReady(key: string, metadata?: Record<string, unknown>) {
-    const current = this.capabilities.get(key)
-    const descriptor: CapabilityDescriptor = {
-      key,
-      state: 'ready',
-      metadata: metadata ?? current?.metadata,
-      updatedAt: Date.now(),
-    }
-
-    this.capabilities.set(key, descriptor)
-    const waiters = this.capabilityWaiters.get(key)
-    if (waiters) {
-      for (const resolve of waiters) {
-        resolve(descriptor)
-      }
-      this.capabilityWaiters.delete(key)
-    }
-
-    return descriptor
+    return this.dependencies.markReady(key, metadata)
   }
 
   markCapabilityDegraded(key: string, metadata?: Record<string, unknown>) {
-    const current = this.capabilities.get(key)
-    const descriptor: CapabilityDescriptor = {
-      key,
-      state: 'degraded',
-      metadata: metadata ?? current?.metadata,
-      updatedAt: Date.now(),
-    }
-
-    this.capabilities.set(key, descriptor)
-    return descriptor
+    return this.dependencies.markDegraded(key, metadata)
   }
 
   withdrawCapability(key: string, metadata?: Record<string, unknown>) {
-    const current = this.capabilities.get(key)
-    const descriptor: CapabilityDescriptor = {
-      key,
-      state: 'withdrawn',
-      metadata: metadata ?? current?.metadata,
-      updatedAt: Date.now(),
-    }
-
-    this.capabilities.set(key, descriptor)
-    return descriptor
+    return this.dependencies.withdraw(key, metadata)
   }
 
   listCapabilities() {
-    return [...this.capabilities.values()]
+    return this.dependencies.list()
   }
 
   isCapabilityReady(key: string) {
-    return this.capabilities.get(key)?.state === 'ready'
+    return this.dependencies.isReady(key)
   }
 
   async waitForCapabilities(keys: string[], timeoutMs: number = 15000) {
-    await Promise.all(keys.map(async key => await this.waitForCapability(key, timeoutMs)))
+    await this.dependencies.waitForMany(keys, timeoutMs)
   }
 
   async waitForCapability(key: string, timeoutMs: number = 15000) {
-    const existing = this.capabilities.get(key)
-    if (existing?.state === 'ready') {
-      return existing
-    }
-
-    return await new Promise<CapabilityDescriptor>((resolve, reject) => {
-      let timeout: ReturnType<typeof setTimeout> | undefined
-      const onReady = (descriptor: CapabilityDescriptor) => {
-        if (timeout) {
-          clearTimeout(timeout)
-        }
-        resolve(descriptor)
-      }
-
-      const waiters = this.capabilityWaiters.get(key) ?? new Set()
-      waiters.add(onReady)
-      this.capabilityWaiters.set(key, waiters)
-
-      timeout = setTimeout(() => {
-        const currentWaiters = this.capabilityWaiters.get(key)
-        currentWaiters?.delete(onReady)
-        if (currentWaiters && currentWaiters.size === 0) {
-          this.capabilityWaiters.delete(key)
-        }
-        reject(new Error(`Capability \`${key}\` is not ready after ${timeoutMs}ms.`))
-      }, timeoutMs)
-    })
+    return await this.dependencies.waitFor(key, timeoutMs)
   }
 
   markConfigurationNeeded(sessionId: string, reason?: string) {
     // Explicit rollback/forward hook into "configuration-needed" phase.
     // Mirrors procedure step 17 where module may request reconfiguration.
-    const session = this.sessions.get(sessionId)
+    const session = this.sessionService.get(sessionId)
     if (!session) {
       throw new Error(`Unable to update plugin session: ${sessionId}`)
     }
@@ -990,31 +1731,23 @@ export class PluginHost {
 
   stop(sessionId: string) {
     // Stop removes session from active registry. Lifecycle first transitions to `stopped`.
-    const session = this.sessions.get(sessionId)
+    const session = this.sessionService.get(sessionId)
     if (!session) {
       return undefined
     }
 
-    // Prefer guarded transition when allowed; otherwise force-close as a safety fallback.
-    if (session.phase !== 'stopped') {
-      const canStop = session.lifecycle.getSnapshot().can({ type: 'STOP' })
-      if (canStop) {
-        assertTransition(session, 'stopped')
-      }
-      else {
-        session.phase = 'stopped'
-      }
+    const lifecycleHookError = this.cleanupSession(session)
+    if (lifecycleHookError) {
+      throw lifecycleHookError
     }
 
-    session.lifecycle.stop()
-    this.sessions.delete(session.id)
     return session
   }
 
   async reload(sessionId: string, options: PluginStartOptions = {}) {
     // Reload preserves manifest/runtime intent, then performs stop + fresh start.
     // This intentionally creates a new session identity for deterministic re-bootstrap.
-    const previous = this.sessions.get(sessionId)
+    const previous = this.sessionService.get(sessionId)
     if (!previous) {
       throw new Error(`Unable to reload missing plugin session: ${sessionId}`)
     }
@@ -1026,88 +1759,5 @@ export class PluginHost {
       cwd: options.cwd ?? previous.cwd,
       runtime: options.runtime ?? previous.runtime,
     })
-  }
-}
-
-export class FileSystemLoader {
-  /**
-   * Filesystem-backed plugin module loader.
-   *
-   * Responsibilities:
-   * - Resolve runtime-specific entrypoints from `ManifestV1`.
-   * - Import plugin modules from local disk.
-   * - Normalize module exports into either:
-   *   - lazy plugin definition (`definePlugin(...)`) via `loadLazyPluginFor`, or
-   *   - executable plugin hooks (`Plugin`) via `loadPluginFor`.
-   */
-  constructor() {
-
-  }
-
-  /**
-   * Resolve a manifest entrypoint for the requested runtime.
-   *
-   * Resolution order:
-   * 1) `entrypoints.<runtime>`
-   * 2) `entrypoints.default`
-   * 3) `entrypoints.electron` (legacy fallback for current local plugin manifests)
-   *
-   * Throws an actionable error when no entrypoint can be selected.
-   */
-  resolveEntrypointFor(manifest: ManifestV1, options?: PluginLoadOptions) {
-    const runtime = options?.runtime ?? 'electron'
-    const root = options?.cwd ?? cwd()
-    const entrypoint
-      = manifest.entrypoints[runtime]
-        ?? manifest.entrypoints.default
-        ?? manifest.entrypoints.electron
-
-    if (!entrypoint) {
-      throw new Error(''
-        + `Plugin entrypoint is required for runtime \`${runtime}\`. `
-        + 'Define one of `entrypoints.<runtime>`, `entrypoints.default`, '
-        + 'or `entrypoints.electron` in the plugin manifest.',
-      )
-    }
-
-    return join(root, entrypoint)
-  }
-
-  /**
-   * Load a lazy plugin definition (`definePlugin(...)`) without executing setup.
-   *
-   * Use this when host logic wants to inspect plugin metadata/setup contract first
-   * and control when `setup()` is called.
-   */
-  async loadLazyPluginFor(manifest: ManifestV1, options?: PluginLoadOptions) {
-    const entrypoint = this.resolveEntrypointFor(manifest, options)
-    const pluginModule = await import(entrypoint)
-
-    if (isPluginDefinition(pluginModule)) {
-      return pluginModule
-    }
-
-    if (typeof pluginModule === 'object' && pluginModule !== null) {
-      const defaultExport = (pluginModule as { default?: unknown }).default
-      if (isPluginDefinition(defaultExport)) {
-        return defaultExport
-      }
-    }
-
-    throw new Error('Plugin lazy loader expects a definePlugin(...) export.')
-  }
-
-  /**
-   * Load and normalize a plugin entrypoint into executable `Plugin` hooks.
-   *
-   * Accepts:
-   * - a direct `Plugin` export
-   * - a default `Plugin` export
-   * - `definePlugin(...)` (calls `setup()` and returns the resulting `Plugin`)
-   */
-  async loadPluginFor(manifest: ManifestV1, options?: PluginLoadOptions) {
-    const entrypoint = this.resolveEntrypointFor(manifest, options)
-    const pluginModule = await import(entrypoint)
-    return coercePluginFromModule(pluginModule)
   }
 }

@@ -11,9 +11,6 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: nix-update
-
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -39,7 +36,7 @@ jobs:
       - name: Pull with rebase
         run: git pull --rebase --autostash
 
-      - uses: stefanzweifel/git-auto-commit-action@v6
+      - uses: stefanzweifel/git-auto-commit-action@v7
         with:
           commit_message: 'chore(nix): update pnpmDeps hash'
           commit_author: github-actions[bot] <github-actions[bot]@users.noreply.github.com>
