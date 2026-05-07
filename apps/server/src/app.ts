@@ -49,8 +49,11 @@ import { createGreetingRoutes } from './routes/greeting'
 import { createV1CompletionsRoutes } from './routes/openai/v1'
 import { createProviderRoutes } from './routes/providers'
 import { createStripeRoutes } from './routes/stripe'
+import { createSystemMessageEventsRoute } from './routes/events/system-messages'
+import { createSystemMessageRoutes } from './routes/system-message'
 import { createBillingMq } from './services/billing/billing-events'
 import { createBillingService } from './services/billing/billing-service'
+import { createConversationStateBridge } from './services/conversation-state-bridge'
 import { createFluxMeter } from './services/billing/flux-meter'
 import { createCharacterService } from './services/characters'
 import { createChatService } from './services/chats'
@@ -114,6 +117,11 @@ export async function buildApp(deps: AppDeps) {
   // WebSocket setup — must be registered BEFORE bodyLimit middleware
   const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app })
   const chatWsSetup = createChatWsHandlers(deps.chatService, deps.redis, deps.otel?.engagement ?? null)
+
+  // Forward robot-side Redis state channels (conversation:state, tts:state,
+  // vision:person_present) to every connected web client. The subscriber
+  // lives for the lifetime of the process.
+  createConversationStateBridge(deps.redis)
 
   app.get('/ws/chat', upgradeWebSocket(async (c) => {
     const token = c.req.query('token')
@@ -202,9 +210,28 @@ export async function buildApp(deps: AppDeps) {
     .route('/api/v1/chats', createChatRoutes(deps.chatService))
 
     /**
-     * Greeting endpoint for person_detector service.
+     * Backward-compatible alias for /api/system-message with role=assistant.
+     * NOTE: Earlier this was registered with `.route('/api', ...)` against a
+     * sub-app whose handler was `.post('/')`, which actually mounted at
+     * `POST /api` and 404'd on `POST /api/greeting` — that's the failure the
+     * person_detector logs were showing. The mount path is now correct.
      */
-    .route('/api', createGreetingRoutes(deps.chatService))
+    .route('/api/greeting', createGreetingRoutes(deps.chatService, deps.redis))
+
+    /**
+     * Generic system-message injection point used by drink_airi side services
+     * (person_detector greetings, proxy fallbacks, voice_capture utterances,
+     * main_task_node feedback). Pushes a chat message and, when `tts: true`,
+     * publishes a `tts:request` redis event so a TTS player can speak it.
+     */
+    .route('/api/system-message', createSystemMessageRoutes(deps.chatService, deps.redis))
+
+    /**
+     * SSE stream of TTS requests. Stage-web subscribes to this so person_detector
+     * greetings / proxy canned responses / ROS task feedback show up in chat
+     * and get spoken via the browser tab's own audio output.
+     */
+    .route('/api/events/system-messages', createSystemMessageEventsRoute(deps.redis))
 
     /**
      * V1 routes for official provider.

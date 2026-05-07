@@ -5,6 +5,10 @@
 # Node.js
 node_modules
 
+# pnpm content-addressed store (created when running pnpm install inside a
+# workspace-bind-mounted container without an explicit --config.store-dir).
+.pnpm-store/
+
 # Logs
 *.log
 *.logs

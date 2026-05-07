@@ -2,3 +2,6 @@
 **/dist
 **/.temp
 target
+.pnpm-store
+node_modules
+

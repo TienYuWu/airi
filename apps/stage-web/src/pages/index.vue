@@ -13,9 +13,11 @@ import { useBackgroundStore } from '@proj-airi/stage-layouts/stores/background'
 import { HoloCoupon } from '@proj-airi/stage-ui/components'
 import { WidgetStage } from '@proj-airi/stage-ui/components/scenes'
 import { useAudioRecorder } from '@proj-airi/stage-ui/composables/audio/audio-recorder'
+import { useSystemMessageSse } from '@proj-airi/stage-ui/composables/system-message-sse'
 import { useVAD } from '@proj-airi/stage-ui/stores/ai/models/vad'
 import { useChatOrchestratorStore } from '@proj-airi/stage-ui/stores/chat'
 import { useLive2d } from '@proj-airi/stage-ui/stores/live2d'
+import { useAutoTtsStore } from '@proj-airi/stage-ui/stores/modules/auto-tts'
 import { useConsciousnessStore } from '@proj-airi/stage-ui/stores/modules/consciousness'
 import { useHearingSpeechInputPipeline } from '@proj-airi/stage-ui/stores/modules/hearing'
 import { useProvidersStore } from '@proj-airi/stage-ui/stores/providers'
@@ -41,7 +43,23 @@ const { selectedOption, sampledColor } = storeToRefs(backgroundStore)
 const backgroundSurface = useTemplateRef<InstanceType<typeof BackgroundProvider>>('backgroundSurface')
 
 const { syncBackgroundTheme } = useBackgroundThemeColor({ backgroundSurface, selectedOption, sampledColor })
-onMounted(() => syncBackgroundTheme())
+
+// Auto-TTS utility — driven by the system-message SSE subscriber. Local LLM
+// responses still go through Stage.vue's existing speech-pipeline (which owns
+// lip-sync); we'd double-play if we also hooked chat events here.
+const autoTtsStore = useAutoTtsStore()
+
+// SSE subscription that surfaces person_detector greetings, proxy canned
+// responses, and main_task_node feedback in the chat UI + browser audio.
+useSystemMessageSse()
+
+onMounted(() => {
+  syncBackgroundTheme()
+})
+
+onUnmounted(() => {
+  autoTtsStore.dispose()
+})
 
 // Audio + transcription pipeline (mirrors stage-tamagotchi)
 const settingsAudioDeviceStore = useSettingsAudioDevice()
@@ -84,9 +102,9 @@ function getTimestampPrefix(): string {
   return `[${year}-${month}-${day} ${hours}:${minutes}]`
 }
 
-function processVoiceInput(text: string): string | null {
+function processVoiceInput(text: string | undefined): string | null {
   // Trim and validate
-  const trimmed = text.trim()
+  const trimmed = (text ?? '').trim()
   if (!trimmed)
     return null
 
