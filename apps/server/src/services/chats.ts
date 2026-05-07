@@ -439,8 +439,6 @@ export function createChatService(db: Database, metrics?: EngagementMetrics | nu
           role: r.role as MessageRole,
           content: r.content,
           seq: r.seq!,
-          createdAt: r.createdAt.getTime(),
-          updatedAt: r.updatedAt.getTime(),
         }))
 
         return { messages: wireMessages, seq: maxSeq }

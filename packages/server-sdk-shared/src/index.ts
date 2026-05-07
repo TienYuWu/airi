@@ -7,8 +7,6 @@ export interface WireMessage {
   role: 'system' | 'user' | 'assistant' | 'tool' | 'error'
   content: string
   seq: number
-  createdAt: number
-  updatedAt: number
 }
 
 export type MessageRole = WireMessage['role']

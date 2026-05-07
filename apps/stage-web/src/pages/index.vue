@@ -71,6 +71,38 @@ const {
 
 let stopOnStopRecord: (() => void) | undefined
 
+// Wake word and timestamp handling
+const WAKE_WORD = '小美'
+
+function getTimestampPrefix(): string {
+  const now = new Date()
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  const hours = String(now.getHours()).padStart(2, '0')
+  const minutes = String(now.getMinutes()).padStart(2, '0')
+  return `[${year}-${month}-${day} ${hours}:${minutes}]`
+}
+
+function processVoiceInput(text: string): string | null {
+  // Trim and validate
+  const trimmed = text.trim()
+  if (!trimmed)
+    return null
+
+  // Add timestamp prefix
+  const timestamp = getTimestampPrefix()
+  const fullText = `${timestamp} ${trimmed}`
+
+  // Check for wake word - if not present, still send but backend will filter
+  // Frontend provides early user feedback if desired
+  if (!trimmed.includes(WAKE_WORD)) {
+    console.debug(`Voice input without wake word: "${trimmed}"`)
+  }
+
+  return fullText
+}
+
 async function startAudioInteraction() {
   try {
     await initVAD()
@@ -80,7 +112,8 @@ async function startAudioInteraction() {
     // Hook once
     stopOnStopRecord = onStopRecord(async (recording) => {
       const text = await transcribeForRecording(recording)
-      if (!text || !text.trim())
+      const processedText = processVoiceInput(text)
+      if (!processedText)
         return
 
       try {
@@ -88,7 +121,7 @@ async function startAudioInteraction() {
         if (!provider || !activeChatModel.value)
           return
 
-        await chatStore.ingest(text, { model: activeChatModel.value, chatProvider: provider as ChatProvider })
+        await chatStore.ingest(processedText, { model: activeChatModel.value, chatProvider: provider as ChatProvider })
       }
       catch (err) {
         console.error('Failed to send chat from voice:', err)

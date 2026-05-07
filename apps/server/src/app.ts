@@ -45,6 +45,7 @@ import { createCharacterRoutes } from './routes/characters'
 import { createChatWsHandlers } from './routes/chat-ws'
 import { createChatRoutes } from './routes/chats'
 import { createFluxRoutes } from './routes/flux'
+import { createGreetingRoutes } from './routes/greeting'
 import { createV1CompletionsRoutes } from './routes/openai/v1'
 import { createProviderRoutes } from './routes/providers'
 import { createStripeRoutes } from './routes/stripe'
@@ -201,6 +202,11 @@ export async function buildApp(deps: AppDeps) {
     .route('/api/v1/chats', createChatRoutes(deps.chatService))
 
     /**
+     * Greeting endpoint for person_detector service.
+     */
+    .route('/api', createGreetingRoutes(deps.chatService))
+
+    /**
      * V1 routes for official provider.
      */
     .route('/api/v1/openai', createV1CompletionsRoutes(deps.fluxService, deps.billingService, deps.configKV, deps.billingMq, deps.ttsMeter, deps.redis, deps.env, deps.otel?.genAi))
@@ -265,7 +271,7 @@ export async function createApp() {
           try {
             await connection.db.execute('SELECT 1')
             logger.log(`Connected to database on attempt ${attempt}`)
-            await migrateDatabase(connection.db)
+            await migrateDatabase(connection.pool)
             logger.log(`Applied schema on attempt ${attempt}`)
             return connection
           }

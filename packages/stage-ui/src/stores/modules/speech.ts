@@ -39,10 +39,6 @@ export const useSpeechStore = defineStore('speech', () => {
   const isLoadingSpeechProviderVoices = refManualReset<boolean>(false)
   const speechProviderError = refManualReset<string | null>(null)
   const availableVoices = refManualReset<Record<string, VoiceInfo[]>>(() => ({}))
-<<<<<<< HEAD
-  const selectedLanguage = useLocalStorageManualReset<string>('settings/speech/language', 'zh-TW')
-=======
->>>>>>> 589df9aff0e3a771c0354b00e10ce111314e1768
   const modelSearchQuery = refManualReset<string>('')
 
   // Computed properties

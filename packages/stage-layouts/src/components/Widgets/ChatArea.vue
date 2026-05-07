@@ -450,7 +450,6 @@ watch(autoSendEnabled, (enabled) => {
   }
 })
 
-<<<<<<< HEAD
 // Half-duplex: stop recognition while character is speaking, restart after a cooldown.
 // Chrome's Web Speech API captures audio independently of the MediaStream so
 // echoCancellation alone is not reliable — we must pause the recogniser entirely.
@@ -469,10 +468,10 @@ watch(nowSpeaking, async (speaking) => {
       }
     }, 500)
   }
-=======
+})
+
 watch(sendMode, () => {
   lastEnterTime.value = 0
->>>>>>> 589df9aff0e3a771c0354b00e10ce111314e1768
 })
 </script>
 
