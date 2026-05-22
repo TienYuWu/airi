@@ -50,6 +50,7 @@ import { createV1CompletionsRoutes } from './routes/openai/v1'
 import { createProviderRoutes } from './routes/providers'
 import { createStripeRoutes } from './routes/stripe'
 import { createSystemMessageEventsRoute } from './routes/events/system-messages'
+import { createPourCompletedRoutes } from './routes/pour-completed'
 import { createSystemMessageRoutes } from './routes/system-message'
 import { createBillingMq } from './services/billing/billing-events'
 import { createBillingService } from './services/billing/billing-service'
@@ -232,6 +233,13 @@ export async function buildApp(deps: AppDeps) {
      * and get spoken via the browser tab's own audio output.
      */
     .route('/api/events/system-messages', createSystemMessageEventsRoute(deps.redis))
+
+    /**
+     * Pour-completed signal from main_task_node. Republished to the
+     * `robot:pour-completed` Redis channel so bt_supervisor's PostPour branch
+     * can drive the follow-up question + go_home timeout.
+     */
+    .route('/api/robot/pour-completed', createPourCompletedRoutes(deps.redis))
 
     /**
      * V1 routes for official provider.
